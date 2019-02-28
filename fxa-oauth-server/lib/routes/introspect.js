@@ -12,8 +12,10 @@ const hex = require('buf').to.hex;
 
 const PAYLOAD_SCHEMA = Joi.object({
   token: Joi.string().required(),
-  token_type_hint: Joi.string().allow('refresh_token')
+  token_type_hint: Joi.string().equal(['access_token', 'refresh_token'])
 });
+
+// The "token introspection" endpoint, per https://tools.ietf.org/html/rfc7662
 
 module.exports = {
   validate: {
@@ -25,55 +27,54 @@ module.exports = {
       active: Joi.boolean().required(),
       scope: validators.scope.optional(),
       client_id: validators.clientId.optional(),
-      username: Joi.string(),
-      token_type: Joi.string().allow('refresh_token'),
-      //exp: Joi.number(), // expiry time
-      iat: Joi.number(), // issue time
-      nbf: Joi.number(), // no use before time
-      sub: Joi.string().required(), // subject
-      aud: Joi.string(), // audience
-      iss: Joi.string(), // issuer
-      jti: Joi.string().required(), // string identifier, as defined in JWT
-      email: Joi.string().required(),
-      last_used_at: Joi.any().required(),
-      profile_changed_at: Joi.any().required(),
+      token_type: Joi.string().equal(['access_token', 'refresh_token']),
+      exp: Joi.number().optional(),
+      iat: Joi.number().optional(),
+      sub: Joi.string().optional(),
+      iss: Joi.string().optional(),
+      jti: Joi.string().optional(),
+      'fxa-lastUsedAt': Joi.number().optional()
     })
   },
   handler: async function tokenEndpoint(req) {
-    let refreshToken;
-    console.log('pppp', req.payload)
-    try {
-      refreshToken = await db.getRefreshToken(encrypt.hash(req.payload.token));
-    } catch (err) {
-
-      throw new AppError.invalidToken();
-      // TODO - add some logging here
+    let token;
+    let tokenType = req.payload.token_type;
+    const tokenId = encrypt.hash(req.payload.token);
+    if (tokenType === 'access_token' || ! tokenType) {
+      token = await db.getAccessToken(tokenId);
+      if (token) {
+        tokenType = 'access_token';
+      }
     }
-
+    if (tokenType === 'refresh_token' || (! tokenType && ! token)) {
+      // XXX TODO: if the refreshToken belongs to a non-public client,
+      // we should require the client_secret in Authentication header.
+      token = await db.getRefreshToken(tokenId);
+      if (token) {
+        tokenType = 'refresh_token';
+      }
+    }
 
     const response = {
-      active: !! refreshToken
+      active: !! token
     };
 
-    console.log('refreshToken', refreshToken)
-
-    if (refreshToken) {
+    if (token) {
+      if (token.expiresAt) {
+        response.active = (+token.expiresAt < Date.now());
+      }
       Object.assign(response, {
-        //scope: refreshToken.scope,
-        scope: 'profile https://identity.mozilla.com/apps/oldsync',
-        client_id: hex(refreshToken.clientId),
-        // username
-        token_type: 'refresh_token',
-        // exp
-        iat: refreshToken.createdAt.getTime(),
-        nbf: refreshToken.createdAt.getTime(),
-        sub: hex(refreshToken.userId),
-        jti: hex(refreshToken.token),
-        email: refreshToken.email,
-        last_used_at: refreshToken.lastUsedAt.getTime(),
-        profile_changed_at: refreshToken.profileChangedAt,
+        scope: token.scope.toString(),
+        client_id: hex(token.clientId),
+        token_type: tokenType,
+        exp: token.expiresAt && token.expiresAt.getTime(),
+        iat: token.createdAt.getTime(),
+        sub: hex(token.userId),
+        jti: hex(tokenId),
+        'fxa-lastUsedAt': token.lastUsedAt && token.lastUsedAt.getTime(),
       });
     }
+
     return response;
   }
 };
